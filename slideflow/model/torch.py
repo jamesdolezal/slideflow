@@ -168,7 +168,7 @@ class ModelWrapper(torch.nn.Module):
         self,
         img: Tensor,
         slide_features: Optional[Tensor] = None
-    ):
+    ):    
         if slide_features is None and self.num_slide_features:
             raise ValueError("Expected 2 inputs, got 1")
 
@@ -321,7 +321,8 @@ class ModelParams(_base._ModelParams):
         pretrain: Optional[str] = None,
         checkpoint: Optional[str] = None
     ) -> torch.nn.Module:
-
+        if self.model_type() == 'cph':
+            num_slide_features = num_slide_features - 1
         assert num_classes is not None or labels is not None
         if num_classes is None:
             assert labels is not None
@@ -1402,6 +1403,18 @@ class Trainer:
         else:
             log.debug('Validation during training: None')
 
+    def _forward_pass_and_loss(self, slides, images, labels) -> Tuple[Tensor, Tensor]: 
+        """Forward pass and loss calculation for a single batch."""
+        # Slide-level features
+        if self.num_slide_features:
+            _slide_in = [self.slide_input[s] for s in slides]
+            inp = (images, Tensor(_slide_in).to(self.device))
+        else:
+            inp = (images,)  # type: ignore
+        outputs = self.model(*inp)
+        loss = self._calculate_loss(outputs, labels, self.loss_fn)
+        return outputs, loss
+
     def _training_step(self, pb: Progress) -> None:
         assert self.model is not None
         images, labels, slides = next(self.dataloaders['train'])
@@ -1421,14 +1434,7 @@ class Trainer:
                                  and 'n' in self.hp.augment)
                     )
 
-                # Slide-level features
-                if self.num_slide_features:
-                    _slide_in = [self.slide_input[s] for s in slides]
-                    inp = (images, Tensor(_slide_in).to(self.device))
-                else:
-                    inp = (images,)  # type: ignore
-                outputs = self.model(*inp)
-                loss = self._calculate_loss(outputs, labels, self.loss_fn)
+                outputs, loss = self._forward_pass_and_loss(slides, images, labels)
 
             # Update weights
             if self.mixed_precision and self.device.type == 'cuda':
@@ -1790,6 +1796,29 @@ class Trainer:
         self._close_dataloaders()
         if pool is not None:
             pool.close()
+        return results
+
+    def _update_log_epoch_metrics(self, results, save_model) -> None:
+        loss = self.running_loss / self.epoch_records
+        epoch_metrics = {'train_metrics': {'loss': loss}}
+        if self.hp.model_type() == 'categorical':
+            acc, acc_desc = self._calculate_accuracy(
+                self.running_corrects, self.epoch_records
+            )
+            epoch_metrics['train_metrics'].update({
+                'accuracy': self._accuracy_as_numpy(acc)  # type: ignore
+            })
+        elif self.hp.model_type() == 'linear':
+            acc, acc_desc = 0, ''  # type: ignore
+        else:
+            raise errors.ModelError(
+                f"Model type {self.hp.model_type()} not recognized"
+            )
+        results['epochs'][f'epoch{self.epoch}'].update(epoch_metrics)
+        self._log_epoch('train', self.epoch, loss, acc_desc)
+        self._log_to_neptune(loss, acc, 'train', 'epoch')
+        if save_model and (self.epoch in self.hp.epochs or self.early_stop):
+            self._save_model()
         return results
 
     def train(
@@ -2025,23 +2054,7 @@ class Trainer:
                     self.step += 1
                     self.global_step += 1
 
-            # Update and log epoch metrics ------------------------------------
-            loss = self.running_loss / self.epoch_records
-            epoch_metrics = {'train_metrics': {'loss': loss}}
-            if self.hp.model_type() == 'categorical':
-                acc, acc_desc = self._calculate_accuracy(
-                    self.running_corrects, self.epoch_records
-                )
-                epoch_metrics['train_metrics'].update({
-                    'accuracy': self._accuracy_as_numpy(acc)  # type: ignore
-                })
-            else:
-                acc, acc_desc = 0, ''  # type: ignore
-            results['epochs'][f'epoch{self.epoch}'].update(epoch_metrics)
-            self._log_epoch('train', self.epoch, loss, acc_desc)
-            self._log_to_neptune(loss, acc, 'train', 'epoch')
-            if save_model and (self.epoch in self.hp.epochs or self.early_stop):
-                self._save_model()
+            results = self._update_log_epoch_metrics(results, save_model)
 
             # Full evaluation -------------------------------------------------
             # Perform full evaluation if the epoch is one of the
@@ -2102,160 +2115,29 @@ class CPHTrainer(Trainer):
             raise errors.ModelError('Model error - CPH models must '
                                     'include event input')
         
-    def _accuracy_as_numpy(
-        self,
-        acc: Union[Tensor, float, List[Tensor], List[float]]
-    ) -> Union[float, List[float]]:
-        if isinstance(acc, list):
-            return [t.item() if isinstance(t, Tensor) else t for t in acc]
-        else:
-            return (acc.item() if isinstance(acc, Tensor) else acc)
+    def _setup_inputs(self) -> None:
+        # Setup slide-level input
+        num_features = self.num_slide_features - 1
+        if num_features > 0:
+            log.info(f'Training with both images and {num_features} '
+                        'categories of slide-level input')
+            log.info('Interpreting first feature as event for CPH model')
+        elif num_features == 0:
+            log.info('Training with images alone. Interpreting first '
+                        'feature as event for CPH model')
+        else :
+            raise errors.ModelError("Unable to find slide-level input at "
+                                    "'input' key in annotations")
+        assert self.slide_input is not None
+        for slide in self.slides:
+            if len(self.slide_input[slide]) != self.num_slide_features:
+                num_in_feature_table = len(self.slide_input[slide])
+                raise errors.ModelError(
+                    f'Length of input for slide {slide} does not match '
+                    f'feature_sizes; expected {self.num_slide_features}, got '
+                    f'{num_in_feature_table}'
+                )
 
-    def _build_model(
-        self,
-        checkpoint: Optional[str] = None,
-        pretrain: Optional[str] = None
-    ) -> None:
-        if checkpoint:
-            log.info(f"Loading checkpoint at [green]{checkpoint}")
-            self.load(checkpoint)
-        else:
-            self.model = self.hp.build_model(
-                labels=self.labels,
-                pretrain=pretrain,
-                num_slide_features=self.num_slide_features
-            )
-        # Create an inference model before any multi-GPU parallelization
-        # is applied to the self.model parameter
-        self.inference_model = self.model
-
-    def _calculate_accuracy(
-        self,
-        running_corrects: Union[Tensor, Dict[Any, Tensor]],
-        num_records: int = 1
-    ) -> Tuple[Union[Tensor, List[Tensor]], str]:
-        '''Reports accuracy of each outcome.'''
-        assert self.hp.model_type() == 'categorical'
-        if self.num_outcomes > 1:
-            if not isinstance(running_corrects, dict):
-                raise ValueError("Expected running_corrects to be a dict:"
-                                 " num_outcomes is > 1")
-            acc_desc = ''
-            acc_list = [running_corrects[r] / num_records
-                        for r in running_corrects]
-            for o in range(len(running_corrects)):
-                _acc = running_corrects[f'out-{o}'] / num_records
-                acc_desc += f"out-{o} acc: {_acc:.4f} "
-            return acc_list, acc_desc
-        else:
-            assert not isinstance(running_corrects, dict)
-            _acc = running_corrects / num_records
-            return _acc, f'acc: {_acc:.4f}'
-
-    def _calculate_loss(
-        self,
-        outputs: Union[Tensor, List[Tensor]],
-        labels: Union[Tensor, Dict[Any, Tensor]],
-        loss_fn: torch.nn.modules.loss._Loss
-    ) -> Tensor:
-        '''Calculates loss in a manner compatible with multiple outcomes.'''
-        if self.num_outcomes > 1:
-            if not isinstance(labels, dict):
-                raise ValueError("Expected labels to be a dict: num_outcomes"
-                                 " is > 1")
-            loss = sum([
-                loss_fn(out, labels[f'out-{o}'])
-                for o, out in enumerate(outputs)
-            ])
-        else:
-            loss = loss_fn(outputs, labels)
-        return loss  # type: ignore
-
-    def _check_early_stopping(
-        self,
-        val_acc: Optional[Union[float, List[float]]] = None,
-        val_loss: Optional[float] = None
-    ) -> str:
-        if val_acc is None and val_loss is None:
-            if (self.hp.early_stop
-               and self.hp.early_stop_method == 'manual'
-               and self.hp.manual_early_stop_epoch <= self.epoch  # type: ignore
-               and self.hp.manual_early_stop_batch <= self.step):  # type: ignore
-                log.info(f'Manual early stop triggered: epoch {self.epoch}, '
-                         f'batch {self.step}')
-                if self.epoch not in self.hp.epochs:
-                    self.hp.epochs += [self.epoch]
-                self.early_stop = True
-        else:
-            if self.hp.early_stop_method == 'accuracy':
-                if self.num_outcomes > 1:
-                    raise errors.ModelError(
-                        "Early stopping method 'accuracy' not supported with"
-                        " multiple outcomes; use 'loss'.")
-                early_stop_val = val_acc
-            else:
-                early_stop_val = val_loss
-            assert early_stop_val is not None
-            assert isinstance(early_stop_val, float)
-
-            self.moving_average += [early_stop_val]
-            if len(self.moving_average) >= self.ema_observations:
-                # Only keep track of the last [ema_observations]
-                self.moving_average.pop(0)
-                if self.last_ema == -1:
-                    # Simple moving average
-                    self.last_ema = (sum(self.moving_average)
-                                     / len(self.moving_average))  # type: ignore
-                    log_msg = f' (SMA: {self.last_ema:.3f})'
-                else:
-                    alpha = (self.ema_smoothing / (1 + self.ema_observations))
-                    self.last_ema = (early_stop_val * alpha
-                                     + (self.last_ema * (1 - alpha)))
-                    log_msg = f' (EMA: {self.last_ema:.3f})'
-                    if self.neptune_run and self.last_ema != -1:
-                        neptune_dest = "metrics/val/batch/exp_moving_avg"
-                        self.neptune_run[neptune_dest].log(self.last_ema)
-
-                if (self.hp.early_stop
-                   and self.ema_two_checks_prior != -1
-                   and self.epoch > self.hp.early_stop_patience):
-
-                    if ((self.hp.early_stop_method == 'accuracy'
-                         and self.last_ema <= self.ema_two_checks_prior)
-                       or (self.hp.early_stop_method == 'loss'
-                           and self.last_ema >= self.ema_two_checks_prior)):
-
-                        log.info(f'Early stop triggered: epoch {self.epoch}, '
-                                 f'step {self.step}')
-                        self._log_early_stop_to_neptune()
-                        if self.epoch not in self.hp.epochs:
-                            self.hp.epochs += [self.epoch]
-                        self.early_stop = True
-                        return log_msg
-
-                self.ema_two_checks_prior = self.ema_one_check_prior
-                self.ema_one_check_prior = self.last_ema
-        return ''
-
-    def _detect_patients(self, *args):
-        self.patients = dict()
-        for dataset in args:
-            if dataset is None:
-                continue
-            dataset_patients = dataset.patients()
-            if not dataset_patients:
-                self.patients.update({s: s for s in self.slides})
-            else:
-                self.patients.update(dataset_patients)
-
-    def _empty_corrects(self) -> Union[int, Dict[str, int]]:
-        if self.multi_outcome:
-            return {
-                f'out-{o}': 0
-                for o in range(self.num_outcomes)
-            }
-        else:
-            return 0
 
     def _epoch_metrics(
         self,
@@ -2271,6 +2153,8 @@ class CPHTrainer(Trainer):
     def _val_metrics(self, **kwargs) -> Dict[str, Dict[str, float]]:
         """Evaluate model and calculate metrics.
 
+        CPH includes accordance index
+
         Returns:
             Dict[str, Dict[str, float]]: Dict with validation metrics.
             Returns metrics in the form:
@@ -2278,7 +2162,7 @@ class CPHTrainer(Trainer):
             {
                 'val_metrics': {
                     'loss': ...,
-                    'accuracy': ...,
+                    'accordance index': ...,
                 },
                 'tile_auc': ...,
                 'slide_auc': ...,
@@ -2295,17 +2179,12 @@ class CPHTrainer(Trainer):
 
         # Preparations for calculating accuracy/loss in metrics_from_dataset()
         def update_corrects(pred, labels, running_corrects=None):
-            if running_corrects is None:
-                running_corrects = self._empty_corrects()
-            if self.hp.model_type() == 'categorical':
-                labels = self._labels_to_device(labels, self.device)
-                return self._update_corrects(pred, labels, running_corrects)
-            else:
-                return 0
+            return 0
 
-        def update_loss(pred, labels, running_loss, size):
+        def update_loss(pred, labels, event_indicator, running_loss, size):
             labels = self._labels_to_device(labels, self.device)
-            loss = self._calculate_loss(pred, labels, self.loss_fn)
+            event_indicator = Tensor(event_indicator).to(self.device)
+            loss = self._calculate_loss(pred, labels, event_indicator, self.loss_fn)
             return running_loss + (loss.item() * size)
 
         torch_args = types.SimpleNamespace(
@@ -2329,15 +2208,10 @@ class CPHTrainer(Trainer):
             **kwargs
         )
         loss_and_acc = {'loss': loss}
-        if self.hp.model_type() == 'categorical':
-            loss_and_acc.update({'accuracy': acc})
-            self._log_epoch(
-                'val',
-                self.epoch,
-                loss,
-                self._calculate_accuracy(acc)[1]  # type: ignore
-            )
         epoch_metrics = {'val_metrics': loss_and_acc}
+        # TODO: remove
+        # loss_and_c = {'loss': loss, 'c_index': c_index}
+        # epoch_metrics = {'val_metrics': loss_and_c}
 
         for metric in metrics:
             if metrics[metric]['tile'] is None:
@@ -2354,356 +2228,6 @@ class CPHTrainer(Trainer):
         self._log_eval_to_neptune(loss, acc, metrics, epoch_metrics)
         return epoch_metrics
 
-    def _fit_normalizer(self, norm_fit: Optional[NormFit]) -> None:
-        """Fit the Trainer normalizer using the specified fit, if applicable.
-
-        Args:
-            norm_fit (Optional[Dict[str, np.ndarray]]): Normalizer fit.
-        """
-        if norm_fit is not None and not self.normalizer:
-            raise ValueError("norm_fit supplied, but model params do not"
-                             "specify a normalizer.")
-        if self.normalizer and norm_fit is not None:
-            self.normalizer.set_fit(**norm_fit)  # type: ignore
-        elif (self.normalizer
-              and 'norm_fit' in self.config
-              and self.config['norm_fit'] is not None):
-            log.debug("Detecting normalizer fit from model config")
-            self.normalizer.set_fit(**self.config['norm_fit'])
-
-    def _has_gpu_normalizer(self) -> bool:
-        import slideflow.norm.torch
-        return (isinstance(self.normalizer, sf.norm.torch.TorchStainNormalizer)
-                and self.normalizer.device != "cpu")
-
-    def _labels_to_device(
-        self,
-        labels: Union[Dict[Any, Tensor], Tensor],
-        device: torch.device
-    ) -> Union[Dict[Any, Tensor], Tensor]:
-        '''Moves a set of outcome labels to the given device.'''
-        if self.num_outcomes > 1:
-            if not isinstance(labels, dict):
-                raise ValueError("Expected labels to be a dict: num_outcomes"
-                                 " is > 1")
-            labels = {
-                k: la.to(device, non_blocking=True) for k, la in labels.items()
-            }
-        elif isinstance(labels, dict):
-            labels = torch.stack(list(labels.values()), dim=1)
-            return labels.to(device, non_blocking=True)
-        else:
-            labels = labels.to(device, non_blocking=True)
-        return labels
-
-    def _log_epoch(
-        self,
-        phase: str,
-        epoch: int,
-        loss: float,
-        accuracy_desc: str,
-    ) -> None:
-        """Logs epoch description."""
-        log.info(f'[bold blue]{phase}[/] Epoch {epoch} | loss:'
-                 f' {loss:.4f} {accuracy_desc}')
-
-    def _log_manifest(
-        self,
-        train_dts: Optional["sf.Dataset"],
-        val_dts: Optional["sf.Dataset"],
-        labels: Optional[Union[str, Dict]] = 'auto'
-    ) -> None:
-        """Log the tfrecord and label manifest to slide_manifest.csv
-
-        Args:
-            train_dts (sf.Dataset): Training dataset. May be None.
-            val_dts (sf.Dataset): Validation dataset. May be None.
-            labels (dict, optional): Labels dictionary. May be None.
-                Defaults to 'auto' (read from self.labels).
-        """
-        if labels == 'auto':
-            _labels = self.labels
-        elif labels is None:
-            _labels = None
-        else:
-            assert isinstance(labels, dict)
-            _labels = labels
-        log_manifest(
-            (train_dts.tfrecords() if train_dts else None),
-            (val_dts.tfrecords() if val_dts else None),
-            labels=_labels,
-            filename=join(self.outdir, 'slide_manifest.csv')
-        )
-
-    def _log_to_tensorboard(
-        self,
-        loss: float,
-        acc: Union[float, List[float]],
-        label: str
-    ) -> None:
-        self.writer.add_scalar(f'Loss/{label}', loss, self.global_step)
-        if self.hp.model_type() == 'categorical':
-            if self.num_outcomes > 1:
-                assert isinstance(acc, list)
-                for o, _acc in enumerate(acc):
-                    self.writer.add_scalar(
-                        f'Accuracy-{o}/{label}', _acc, self.global_step
-                    )
-            else:
-                self.writer.add_scalar(
-                    f'Accuracy/{label}', acc, self.global_step
-                )
-
-    def _log_to_neptune(
-        self,
-        loss: float,
-        acc: Union[Tensor, List[Tensor]],
-        label: str,
-        phase: str
-    ) -> None:
-        """Logs epoch loss/accuracy to Neptune."""
-        assert phase in ('batch', 'epoch')
-        step = self.epoch if phase == 'epoch' else self.global_step
-        if self.neptune_run:
-            self.neptune_run[f"metrics/{label}/{phase}/loss"].log(loss,
-                                                                  step=step)
-            acc = self._accuracy_as_numpy(acc)
-            if isinstance(acc, list):
-                for a, _acc in enumerate(acc):
-                    sf.util.neptune_utils.list_log(
-                        run=self.neptune_run,
-                        label=f'metrics/{label}/{phase}/accuracy-{a}',
-                        val=_acc,
-                        step=step
-                    )
-            else:
-                sf.util.neptune_utils.list_log(
-                    run=self.neptune_run,
-                    label=f'metrics/{label}/{phase}/accuracy',
-                    val=acc,
-                    step=step
-                )
-
-
-    def _log_early_stop_to_neptune(self) -> None:
-        # Log early stop to neptune
-        if self.neptune_run:
-            self.neptune_run["early_stop/early_stop_epoch"] = self.epoch
-            self.neptune_run["early_stop/early_stop_batch"] = self.step
-            self.neptune_run["early_stop/method"] = self.hp.early_stop_method
-            self.neptune_run["sys/tags"].add("early_stopped")
-
-    def _log_eval_to_neptune(
-        self,
-        loss: float,
-        acc: float,
-        metrics: Dict[str, Any],
-        epoch_results: Dict[str, Any]
-    ) -> None:
-        if self.use_neptune:
-            assert self.neptune_run is not None
-            self.neptune_run['results'] = epoch_results
-
-            # Validation epoch metrics
-            self.neptune_run['metrics/val/epoch/loss'].log(loss,
-                                                           step=self.epoch)
-            sf.util.neptune_utils.list_log(
-                self.neptune_run,
-                'metrics/val/epoch/accuracy',
-                acc,
-                step=self.epoch
-            )
-            for metric in metrics:
-                if metrics[metric]['tile'] is None:
-                    continue
-                for outcome in metrics[metric]['tile']:
-                    # If only one outcome,
-                    #   log to metrics/val/epoch/[metric].
-                    # If more than one outcome,
-                    #   log to metrics/val/epoch/[metric]/[outcome_name]
-                    def metric_label(s):
-                        if len(metrics[metric]['tile']) == 1:
-                            return f'metrics/val/epoch/{s}_{metric}'
-                        else:
-                            return f'metrics/val/epoch/{s}_{metric}/{outcome}'
-
-                    tile_metric = metrics[metric]['tile'][outcome]
-                    slide_metric = metrics[metric]['slide'][outcome]
-                    patient_metric = metrics[metric]['patient'][outcome]
-
-                    # If only one value for a metric, log to .../[metric]
-                    # If more than one value for a metric
-                    #   (e.g. AUC for each category),
-                    # log to .../[metric]/[i]
-                    sf.util.neptune_utils.list_log(
-                        self.neptune_run,
-                        metric_label('tile'),
-                        tile_metric,
-                        step=self.epoch
-                    )
-                    sf.util.neptune_utils.list_log(
-                        self.neptune_run,
-                        metric_label('slide'),
-                        slide_metric,
-                        step=self.epoch
-                    )
-                    sf.util.neptune_utils.list_log(
-                        self.neptune_run,
-                        metric_label('patient'),
-                        patient_metric,
-                        step=self.epoch
-                    )
-
-    def _mid_training_validation(self) -> None:
-        """Perform mid-epoch validation, if appropriate."""
-
-        if not self.validate_on_batch:
-            return
-        elif not (
-            'val' in self.dataloaders
-            and self.step > 0
-            and self.step % self.validate_on_batch == 0
-        ):
-            return
-
-        if self.model is None or self.inference_model is None:
-            raise errors.ModelError("Model not yet initialized.")
-        self.model.eval()
-        running_val_loss = 0
-        num_val = 0
-        running_val_correct = self._empty_corrects()
-
-        for _ in range(self.validation_steps):
-            val_img, val_label, slides, *_ = next(self.mid_train_val_dts)  # type:ignore
-            val_img = val_img.to(self.device)
-            val_img = val_img.to(memory_format=torch.channels_last)
-
-            with torch.no_grad():
-                _mp = (self.mixed_precision and self.device.type in ('cuda', 'cpu'))
-                with autocast(self.device.type, mixed_precision=_mp):  # type: ignore
-
-                    # GPU normalization, if specified.
-                    if self._has_gpu_normalizer():
-                        val_img = self.normalizer.preprocess(val_img)
-
-                    if self.num_slide_features:
-                        _slide_in = [self.slide_input[s] for s in slides]
-                        inp = (val_img, Tensor(_slide_in).to(self.device))
-                    else:
-                        inp = (val_img,)  # type: ignore
-                    val_outputs = self.inference_model(*inp)
-                    val_label = self._labels_to_device(val_label, self.device)
-                    val_batch_loss = self._calculate_loss(
-                        val_outputs, val_label, self.loss_fn
-                    )
-
-            running_val_loss += val_batch_loss.item() * val_img.size(0)
-            if self.hp.model_type() == 'categorical':
-                running_val_correct = self._update_corrects(
-                    val_outputs, val_label, running_val_correct  # type: ignore
-                )
-            num_val += val_img.size(0)
-        val_loss = running_val_loss / num_val
-        if self.hp.model_type() == 'categorical':
-            val_acc, val_acc_desc = self._calculate_accuracy(
-                running_val_correct, num_val  # type: ignore
-            )
-        else:
-            val_acc, val_acc_desc = 0, ''  # type: ignore
-        log_msg = f'Batch {self.step}: val loss: {val_loss:.4f} {val_acc_desc}'
-
-        # Log validation metrics to neptune & check early stopping
-        self._log_to_neptune(val_loss, val_acc, 'val', phase='batch')
-        log_msg += self._check_early_stopping(
-            self._accuracy_as_numpy(val_acc),
-            val_loss
-        )
-        log.info(log_msg)
-
-        # Log to tensorboard
-        if self.use_tensorboard:
-            if self.num_outcomes > 1:
-                assert isinstance(running_val_correct, dict)
-                _val_acc = [
-                    running_val_correct[f'out-{o}'] / num_val
-                    for o in range(len(val_outputs))
-                ]
-            else:
-                assert not isinstance(running_val_correct, dict)
-                _val_acc = running_val_correct / num_val  # type: ignore
-            self._log_to_tensorboard(
-                val_loss,
-                self._accuracy_as_numpy(_val_acc),
-                'test'
-            )  # type: ignore
-
-        # Put model back in training mode
-        self.model.train()
-
-    def _prepare_optimizers_and_loss(self) -> None:
-        if self.model is None:
-            raise ValueError("Model has not yet been initialized.")
-        self.optimizer = self.hp.get_opt(self.model.parameters())
-        if self.hp.learning_rate_decay:
-            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizer,
-                gamma=self.hp.learning_rate_decay
-            )
-            log.debug("Using exponentially decaying learning rate")
-        else:
-            self.scheduler = None  # type: ignore
-        self.loss_fn = self.hp.get_loss()
-        if self.mixed_precision and self.device.type == 'cuda':
-            self.scaler = torch.cuda.amp.GradScaler()
-
-    def _prepare_neptune_run(self, dataset: "sf.Dataset", label: str) -> None:
-        if self.use_neptune:
-            tags = [label]
-            if 'k-fold' in self.config['validation_strategy']:
-                tags += [f'k-fold{self.config["k_fold_i"]}']
-            self.neptune_run = self.neptune_logger.start_run(
-                self.name,
-                self.config['project'],
-                dataset,
-                tags=tags
-            )
-            assert self.neptune_run is not None
-            self.neptune_logger.log_config(self.config, label)
-            self.neptune_run['data/slide_manifest'].upload(
-                os.path.join(self.outdir, 'slide_manifest.csv')
-            )
-            try:
-                config_path = join(self.outdir, 'params.json')
-                config = sf.util.load_json(config_path)
-                config['neptune_id'] = self.neptune_run['sys/id'].fetch()
-            except Exception:
-                log.info("Unable to log params (params.json) with Neptune.")
-
-    def _print_model_summary(self, train_dts) -> None:
-        """Prints model summary and logs to neptune."""
-        if self.model is None:
-            raise ValueError("Model has not yet been initialized.")
-        empty_inp = [torch.empty(
-            [self.hp.batch_size, 3, train_dts.tile_px, train_dts.tile_px]
-        )]
-        if self.num_slide_features:
-            empty_inp += [
-                torch.empty([self.hp.batch_size, self.num_slide_features])
-            ]
-        if sf.getLoggingLevel() <= 20:
-            model_summary = torch_utils.print_module_summary(
-                self.model, empty_inp
-            )
-            if self.neptune_run:
-                self.neptune_run['summary'] = model_summary
-
-    def _save_model(self) -> None:
-        assert self.model is not None
-        name = self.name if self.name else 'trained_model'
-        save_path = os.path.join(self.outdir, f'{name}_epoch{self.epoch}.zip')
-        torch.save(self.model.state_dict(), save_path)
-        log.info(f"Model saved to [green]{save_path}")
-
     def _close_dataloaders(self):
         """Close dataloaders, ensuring threads have joined."""
         del self.mid_train_val_dts
@@ -2715,163 +2239,36 @@ class CPHTrainer(Trainer):
                 log.debug(f"Closing dataloader {name} via dataset.close()")
                 d.dataset.close()
 
-    def _setup_dataloaders(
+    def _calculate_loss(
         self,
-        train_dts: Optional["sf.Dataset"],
-        val_dts: Optional["sf.Dataset"],
-        mid_train_val: bool = False,
-        incl_labels: bool = True,
-        from_wsi: bool = False,
-        **kwargs
-    ) -> None:
-        """Prepare dataloaders from training and validation."""
-        interleave_args = types.SimpleNamespace(
-            rank=0,
-            num_replicas=1,
-            labels=(self.labels if incl_labels else None),
-            chunk_size=8,
-            pin_memory=True,
-            num_workers=4 if not from_wsi else 0,
-            onehot=False,
-            incl_slidenames=True,
-            from_wsi=from_wsi,
-            **kwargs
-        )
-        # Use GPU stain normalization for PyTorch normalizers, if supported
-        _augment_str = self.hp.augment
-        if self._has_gpu_normalizer():
-            log.info("Using GPU for stain normalization")
-            interleave_args.standardize = False
-            if isinstance(_augment_str, str):
-                _augment_str = _augment_str.replace('n', '')
-        else:
-            interleave_args.normalizer = self.normalizer
+        outputs: Union[Tensor, List[Tensor]],
+        labels: Union[Tensor, Dict[Any, Tensor]],
+        event_indicator: Tensor,
+        loss_fn: torch.nn.modules.loss._Loss
+    ) -> Tensor:
+        """Calculates loss for Cox Proportional Hazards model."""
+        y_true = torch.cat((labels, event_indicator.unsqueeze(1)), dim=1)
+        loss = loss_fn(outputs, y_true)
+        return loss
 
-        if train_dts is not None:
-            self.dataloaders = {
-                'train': iter(train_dts.torch(
-                    infinite=True,
-                    batch_size=self.hp.batch_size,
-                    augment=_augment_str,
-                    transform=self.transform['train'],
-                    drop_last=True,
-                    **vars(interleave_args)
-                ))
-            }
-        else:
-            self.dataloaders = {}
-        if val_dts is not None:
-            if not self.validation_batch_size:
-                validation_batch_size = self.hp.batch_size
-            self.dataloaders['val'] = val_dts.torch(
-                infinite=False,
-                batch_size=validation_batch_size,
-                augment=False,
-                transform=self.transform['val'],
-                incl_loc=True,
-                **vars(interleave_args)
-            )
-            # Mid-training validation dataset
-            if mid_train_val:
-                self.mid_train_val_dts = torch_utils.cycle(
-                    self.dataloaders['val']
-                )
-            if not self.validate_on_batch:
-                val_log_msg = ''
-            else:
-                val_log_msg = f'every {str(self.validate_on_batch)} steps and '
-            log.debug(f'Validation during training: {val_log_msg}at epoch end')
-            if self.validation_steps:
-                num_samples = self.validation_steps * self.hp.batch_size
-                log.debug(
-                    f'Using {self.validation_steps} batches ({num_samples} '
-                    'samples) each validation check'
-                )
-            else:
-                log.debug('Using entire validation set each validation check')
-        else:
-            log.debug('Validation during training: None')
+    def _forward_pass_and_loss(self, slides, images, labels) -> Tuple[Tensor, Tensor]: 
+        """Forward pass and loss calculation for a single batch."""
+        # Slide-level features
+        if self.num_slide_features == 1:
+            inp = (images,)  # type: ignore
+        elif self.num_slide_features > 1:
+            # if slide features are present, pass but exclude the event indicator
+            _slide_in = [self.slide_input[s][1:] for s in slides] # FIXME: debug this line if tensor change things
+            inp = (images, Tensor(_slide_in).to(self.device))
+        outputs = self.model(*inp)
 
-    def _training_step(self, pb: Progress) -> None:
-        assert self.model is not None
-        images, labels, slides = next(self.dataloaders['train'])
-        images = images.to(self.device, non_blocking=True)
-        images = images.to(memory_format=torch.channels_last)
-        labels = self._labels_to_device(labels, self.device)
-        self.optimizer.zero_grad()
-        with torch.set_grad_enabled(True):
-            _mp = (self.mixed_precision and self.device.type in ('cuda', 'cpu'))
-            with autocast(self.device.type, mixed_precision=_mp):  # type: ignore
+        # Get the event indicator for CPH loss calculation
+        event_indicator = [self.slide_input[s][0] for s in slides]
+        event_indicator = Tensor(event_indicator).to(self.device)
 
-                # GPU normalization, if specified.
-                if self._has_gpu_normalizer():
-                    images = self.normalizer.preprocess(
-                        images,
-                        augment=(isinstance(self.hp.augment, str)
-                                 and 'n' in self.hp.augment)
-                    )
-
-                # Slide-level features
-                if self.num_slide_features:
-                    _slide_in = [self.slide_input[s] for s in slides]
-                    inp = (images, Tensor(_slide_in).to(self.device))
-                else:
-                    inp = (images,)  # type: ignore
-                outputs = self.model(*inp)
-                loss = self._calculate_loss(outputs, labels, self.loss_fn)
-
-            # Update weights
-            if self.mixed_precision and self.device.type == 'cuda':
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                self.optimizer.step()
-
-            # Update learning rate if using a scheduler
-            _lr_decay_steps = self.hp.learning_rate_decay_steps
-            if self.scheduler and (self.global_step+1) % _lr_decay_steps == 0:
-                log.debug("Stepping learning rate decay")
-                self.scheduler.step()
-
-        # Record accuracy and loss
-        self.epoch_records += images.size(0)
-        if self.hp.model_type() == 'categorical':
-            self.running_corrects = self._update_corrects(
-                outputs, labels, self.running_corrects
-            )
-            train_acc, acc_desc = self._calculate_accuracy(
-                self.running_corrects, self.epoch_records
-            )
-        else:
-            train_acc, acc_desc = 0, ''  # type: ignore
-        self.running_loss += loss.item() * images.size(0)
-        _loss = self.running_loss / self.epoch_records
-        pb.update(task_id=0,  # type: ignore
-                  description=(f'[bold blue]train[/] '
-                               f'loss: {_loss:.4f} {acc_desc}'))
-        pb.advance(task_id=0)  # type: ignore
-
-        # Log to tensorboard
-        if self.use_tensorboard and self.global_step % self.log_frequency == 0:
-            if self.num_outcomes > 1:
-                _train_acc = [
-                    (self.running_corrects[f'out-{o}']  # type: ignore
-                     / self.epoch_records)
-                    for o in range(len(outputs))
-                ]
-            else:
-                _train_acc = (self.running_corrects  # type: ignore
-                              / self.epoch_records)
-            self._log_to_tensorboard(
-                loss.item(),
-                self._accuracy_as_numpy(_train_acc),
-                'train'
-            )
-        # Log to neptune & check early stopping
-        self._log_to_neptune(loss.item(), train_acc, 'train', phase='batch')
-        self._check_early_stopping(None, None)
+        loss = self._calculate_loss(
+            outputs, labels, event_indicator, self.loss_fn)
+        return outputs, loss
 
     def _update_corrects(
         self,
@@ -2895,10 +2292,7 @@ class CPHTrainer(Trainer):
     def _validate_early_stop(self) -> None:
         """Validates early stopping parameters."""
 
-        if (self.hp.early_stop and self.hp.early_stop_method == 'accuracy' and
-           self.hp.model_type() == 'categorical' and self.num_outcomes > 1):
-            raise errors.ModelError("Cannot combine 'accuracy' early stopping "
-                                    "with multiple categorical outcomes.")
+        # FIXME: go back to this early stopping
         if (self.hp.early_stop_method == 'manual'
             and (self.hp.manual_early_stop_epoch is None
                  or self.hp.manual_early_stop_batch is None)):
@@ -2907,38 +2301,6 @@ class CPHTrainer(Trainer):
                 "manual_early_stop_epoch and manual_early_stop_batch are set "
                 "in model params."
             )
-
-    def _verify_img_format(self, dataset, *datasets: Optional["sf.Dataset"]) -> str:
-        """Verify that the image format of the dataset matches the model config.
-
-        Args:
-            dataset (sf.Dataset): Dataset to check.
-            *datasets (sf.Dataset): Additional datasets to check. May be None.
-
-        Returns:
-            str: Image format, either 'png' or 'jpg', if a consistent image
-                format was found, otherwise None.
-
-        """
-        # First, verify all datasets have the same image format
-        img_formats = set([d.img_format for d in datasets if d])
-        if len(img_formats) > 1:
-            log.error("Multiple image formats detected: {}.".format(
-                ', '.join(img_formats)
-            ))
-            return None
-        elif self.img_format and not dataset.img_format:
-            log.warning("Unable to verify image format (PNG/JPG) of dataset.")
-            return None
-        elif self.img_format and dataset.img_format != self.img_format:
-            log.error(
-                "Mismatched image formats. Expected '{}' per model config, "
-                "but dataset has format '{}'.".format(
-                    self.img_format,
-                    dataset.img_format))
-            return None
-        else:
-            return dataset.img_format
 
     def load(self, model: str, training=True) -> None:
         """Loads a state dict at the given model location. Requires that the
@@ -3181,6 +2543,23 @@ class CPHTrainer(Trainer):
         if pool is not None:
             pool.close()
         return results
+
+    def _update_log_epoch_metrics(self, results, save_model) -> None:
+        loss = self.running_loss / self.epoch_records
+        epoch_metrics = {'train_metrics': {'loss': loss}}
+        if self.hp.model_type() != 'cph':
+            raise errors.ModelError(
+                f"Model type {self.hp.model_type()} must be 'cph' for CPHTrainer"
+            )
+        acc, acc_desc = 0, ''
+        # here a running c-index could be calculated
+        results['epochs'][f'epoch{self.epoch}'].update(epoch_metrics)
+        self._log_epoch('train', self.epoch, loss, acc_desc)
+        self._log_to_neptune(loss, acc, 'train', 'epoch')
+        if save_model and (self.epoch in self.hp.epochs or self.early_stop):
+            self._save_model()
+
+        return results 
 
     def train(
         self,

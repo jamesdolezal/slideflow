@@ -90,7 +90,8 @@ def negative_log_likelihood(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     Returns:
         tf.Tensor: Loss.
     """
-    events = tf.reshape(y_pred[:, -1], [-1])  # E
+    # FIXME: why are the events in the predictions?
+    events = tf.reshape(y_pred[:, -1], [-1])  # E 
     pred_hr = tf.reshape(y_pred[:, 0], [-1])  # y_pred
     time = tf.reshape(y_true, [-1])           # y_true
 
