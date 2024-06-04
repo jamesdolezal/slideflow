@@ -194,6 +194,23 @@ class ROI:
             hole.simplify(tolerance)
         self.update_polygon()
 
+    def invert_roi(self, wsi_shape: Tuple[int, int]):
+        '''
+        Invert the ROI within the whole-slide image.
+        ROI becomes a hole in the inverted ROI.
+        Return the inverted ROI.
+        '''
+        # Ensure polygon is generated
+        self.update_polygon()
+        # Calculate polygon bounding box (whole-slide)
+        width, height = wsi_shape
+        roi_wsi_coords = np.array([[0., 0.], [0., height], [width, height], [width, 0.]])
+        # Create the inverted ROI
+        inverted_ROI = ROI(name=self.name, coordinates=roi_wsi_coords)
+        # Add the hole to the ROI
+        inverted_ROI.add_hole(self)
+        return inverted_ROI
+
     def create_triangles(self) -> Optional[np.ndarray]:
         """Create a triangulated mesh from the polygon."""
 
@@ -281,7 +298,11 @@ class ROI:
 
     def validate(self) -> None:
         """Validate the exterior coordinates form a valid polygon."""
-        if len(self.poly_coords()) < 4:
+        try:
+            poly_coords = self.poly_coords()
+        except ValueError as e:
+            raise errors.InvalidROIError(f"Invalid ROI ({self.name}): {e}")
+        if len(poly_coords) < 4:
             raise errors.InvalidROIError(f"Invalid ROI ({self.name}): ROI must contain at least 4 coordinates.")
         if self.poly.geom_type not in ('Polygon', 'MultiPolygon', 'GeometryCollection'):
             raise errors.InvalidROIError(
@@ -344,30 +365,38 @@ class Alignment:
     def __init__(
         self,
         origin: Tuple[int, int],
+        scale: float,
         coord: Optional[np.ndarray] = None
     ) -> None:
         self.origin = origin
+        self.scale = scale
         self.coord = coord
         self.centroid = None  # type: Tuple[float, float]
         self.normal = None    # type: Tuple[float, float]
 
+    def __repr__(self):
+        return f"<Alignment (origin={self.origin}, coord={self.coord}, centroid={self.centroid}, normal={self.normal})>"
+
     @classmethod
-    def from_fit(cls, origin, centroid, normal):
-        obj = cls(origin, None)
+    def from_fit(cls, origin, scale, centroid, normal):
+        obj = cls(origin, scale, None)
         obj.centroid = centroid
         obj.normal = normal
         return obj
 
     @classmethod
-    def from_translation(cls, origin):
-        return cls(origin, None)
+    def from_translation(cls, origin, scale):
+        return cls(origin, scale, None)
 
     @classmethod
     def from_coord(cls, origin, coord):
-        return cls(origin, coord)
+        return cls(origin, None, coord)
 
     def save(self, path):
-        save_dict = dict(origin=np.array(self.origin))
+        save_dict = dict(
+            origin=np.array(self.origin),
+            scale=np.array(self.scale)
+        )
         if self.coord is not None:
             save_dict['coord'] = self.coord
         if self.centroid is not None:
@@ -380,10 +409,11 @@ class Alignment:
     def load(cls, path):
         load_dict = np.load(path, allow_pickle=True)
         origin = tuple(load_dict['origin'])
+        scale = load_dict['scale']
         coord = load_dict['coord'] if 'coord' in load_dict else None
         centroid = load_dict['centroid'] if 'centroid' in load_dict else None
         normal = load_dict['normal'] if 'normal' in load_dict else None
-        obj = cls(origin, coord)
+        obj = cls(origin, scale, coord)
         obj.centroid = centroid
         obj.normal = normal
         return obj

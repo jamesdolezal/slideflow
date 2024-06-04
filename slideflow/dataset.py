@@ -185,7 +185,7 @@ def _handle_slide_errors(path: str):
     except (KeyboardInterrupt, SystemExit) as e:
         print('Exiting...')
         raise e
-    
+
 
 def _tile_extractor(
     path: str,
@@ -228,7 +228,7 @@ def _tile_extractor(
             if render_thumb and isinstance(report, SlideReport):
                 _ = report.thumb
             reports.update({path: report})
-    
+
 
 def _buffer_slide(path: str, dest: str) -> str:
     """Buffer a slide to a path."""
@@ -628,10 +628,7 @@ class Dataset:
             )
         # Create labels for each source based on tile size
         if (tile_px is not None) and (tile_um is not None):
-            if isinstance(tile_um, str):
-                label = f"{tile_px}px_{tile_um.lower()}"
-            else:
-                label = f"{tile_px}px_{tile_um}um"
+            label = sf.util.tile_size_label(tile_px, tile_um)
         else:
             label = None
         for source in self.sources:
@@ -1496,6 +1493,8 @@ class Dataset:
         qc: Optional[Union[str, Callable, List[Callable]]] = None,
         report: bool = True,
         use_edge_tiles: bool = False,
+        artifact_rois: Optional[Union[List[str], str]] = list(),
+        mpp_override: Optional[float] = None,
         **kwargs: Any
     ) -> Dict[str, SlideReport]:
         r"""Extract tiles from a group of slides.
@@ -1605,6 +1604,10 @@ class Dataset:
                 Defaults to None.
             use_edge_tiles (bool): Use edge tiles in extraction. Areas
                 outside the slide will be padded white. Defaults to False.
+            artifact_rois (list(str) or str, optional): List of ROI issue labels
+                to treat as artifacts. Whenever this is not None, all the ROIs with
+                referred label will be inverted with ROI.invert_roi().
+                Defaults to an empty list.
 
         Returns:
             Dictionary mapping slide paths to each slide's SlideReport
@@ -1625,6 +1628,10 @@ class Dataset:
             sources = list(self.sources.keys())
         all_reports = []
         self.verify_annotations_slides()
+
+        # Ensure self.artifact_rois is a list
+        if isinstance(artifact_rois, str):
+            artifact_rois = [artifact_rois]
 
         # Log the active slide reading backend
         col = 'green' if sf.slide_backend() == 'cucim' else 'cyan'
@@ -1746,7 +1753,9 @@ class Dataset:
                     'roi_filter_method': roi_filter_method,
                     'origin': 'random' if randomize_origin else (0, 0),
                     'pb': pb,
-                    'use_edge_tiles': use_edge_tiles
+                    'use_edge_tiles': use_edge_tiles,
+                    'artifact_rois': artifact_rois,
+                    'mpp': mpp_override
                 }
                 extraction_kwargs = {
                     'tfrecord_dir': tfrecord_dir,
@@ -1780,6 +1789,7 @@ class Dataset:
                         thread.join()
                     else:
                         for slide in slide_list:
+                            log.info(f'Extracting tiles from {os.path.basename(slide)}')
                             with _handle_slide_errors(slide):
                                 wsi = _prepare_slide(
                                     slide,
@@ -1982,6 +1992,149 @@ class Dataset:
 
         log.info("Bag filtering complete. {} bags filtered.".format(n_complete))
 
+    def filter_bags_by_df(
+        self,
+        bags_path: str,
+        dest: str,
+        df: pd.DataFrame,
+        *,
+        column_name: str = 'extract',
+        threshold: float = None,
+        lower_than: bool = False
+    ) -> None:
+        """Filter bags by tiles in an df
+
+        Args:
+            bags_path (str): Path to the bags directory.
+            dest (str): Path to the destination directory.
+            df (pd.DataFrame): Dataframe with slide, loc_x, loc_y, and column_name.
+            column_name (str): Column name to use for filtering. Defaults to 'extract'.
+            threshold (float): Threshold for filtering, applies to column name, 
+                if None, column_name is assumed to be boolean.
+            lower_than (bool): If True, filter values lower than threshold.
+        """
+        import torch
+
+        if not exists(dest):
+            os.makedirs(dest)
+
+        n_complete = 0
+        for slide in tqdm(df.slide.unique()):
+            if not exists(join(bags_path, slide+'.pt')):
+                continue
+
+            df_slide = df.loc[df.slide == slide].copy()
+
+            # Get the bag
+            bag = torch.load(join(bags_path, slide+'.pt'))
+            bag_index = np.load(join(bags_path, slide+'.index.npz'))['arr_0']
+
+            # if threshold is set, filter the dataframe
+            if threshold is not None:
+                if lower_than:
+                    df_slide[column_name] = df_slide[column_name] < threshold
+                else:
+                    df_slide[column_name] = df_slide[column_name] > threshold
+
+            #print(df_slide)
+            # Get the common locations
+            bag_locs = {tuple(r) for r in bag_index}
+            selected_locs = {tuple(row[['loc_x', 'loc_y']]) for _, row in df_slide[df_slide[column_name]].iterrows()}
+            common_locs = bag_locs.intersection(selected_locs)
+
+            # Find indices in the bag that match the common locations (in an ROI)
+            bag_i = [i for i, row in enumerate(bag_index) if tuple(row) in common_locs]
+            if not len(bag_i):
+                log.debug("No common locations found for {}".format(slide))
+                continue
+
+            # Subset and save the bag
+            bag = bag[bag_i]
+            torch.save(bag, join(dest, slide+'.pt'))
+
+            # Subset and save the index file
+            bag_index = bag_index[bag_i]
+            np.savez_compressed(join(dest, slide + '.index.npz'), bag_index)
+
+            log.debug("Subset size ({}): {} -> {}".format(slide, len(bag_index), len(bag)))
+            n_complete += 1
+
+        log.info("Bag filtering complete. {} bags filtered.".format(n_complete))
+    
+    def return_represantative_tile_df(
+        self,
+        bags_path: str,
+        aggregation_method: str = 'mean',
+        distance_method: str = 'euclidean',
+    ) -> pd.DataFrame:
+        """Return a dataframe with a representative tile for each slide.
+
+        Args:
+            bags_path (str): Path to the bags directory.
+            dest (str): Path to the destination directory.
+            aggregation_method (str): Method to aggregate the tiles in the bag.
+                Defaults to 'mean'.
+            distance_method (str): Method to find the closest tile to the centroid.
+                Defaults to 'euclidean'.
+
+        Returns:
+            pd.DataFrame: DataFrame with representative tile information for each slide.
+        """
+        import torch
+        from sklearn.metrics.pairwise import pairwise_distances
+
+        # Initialize an empty DataFrame to store the results
+        result_df = pd.DataFrame()
+
+        for slide in tqdm(os.listdir(bags_path)):
+            if not slide.endswith('.pt'):
+                continue
+
+            # Load the bag and index
+            bag_path = os.path.join(bags_path, slide)
+            index_path = os.path.join(bags_path, slide.replace('.pt', '.index.npz'))
+
+            bag = torch.load(bag_path)
+            bag_index = np.load(index_path)['arr_0']
+
+            # Aggregate the tiles using the specified method
+            if aggregation_method == 'mean':
+                centroid = torch.mean(bag, dim=0)
+            elif aggregation_method == 'median':
+                centroid = torch.median(bag, dim=0).values
+            else:
+                raise ValueError(f"Invalid aggregation method: {aggregation_method}")
+
+            # Find the closest tile to the centroid using the specified distance method
+            if distance_method == 'euclidean':
+                distances = pairwise_distances(bag.numpy(), centroid.unsqueeze(0).numpy(), metric='euclidean')
+            elif distance_method == 'manhattan':
+                distances = pairwise_distances(bag.numpy(), centroid.unsqueeze(0).numpy(), metric='manhattan')
+            elif distance_method == 'l1':
+                distances = pairwise_distances(bag.numpy(), centroid.unsqueeze(0).numpy(), metric='l1')
+            elif distance_method == 'cosine':
+                distances = pairwise_distances(bag.numpy(), centroid.unsqueeze(0).numpy(), metric='cosine')
+            else:
+                raise ValueError(f"Invalid distance method: {distance_method}")
+
+            closest_idx = np.argmin(distances)
+
+            # Get the representative tile information
+            loc_x, loc_y = bag_index[closest_idx]
+            activations = bag[closest_idx].numpy()
+
+            # Create a DataFrame for the representative tile
+            tile_df = pd.DataFrame({
+                'slide': [slide.replace('.pt', '')],
+                'locations': [np.array([loc_x, loc_y])],
+                'activations': [activations]
+            })
+
+            # Concatenate the representative tile DataFrame to the result DataFrame
+            result_df = pd.concat([result_df, tile_df], ignore_index=True)
+
+        return result_df
+    
     def find_rois(self, slide: str) -> Optional[str]:
         """Find an ROI path from a given slide.
 
