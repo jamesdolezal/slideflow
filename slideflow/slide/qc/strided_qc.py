@@ -284,7 +284,7 @@ class _StridedQC_V2:
         """Return an empty array for storing masks."""
         return np.ones((wsi.grid.shape[1], wsi.grid.shape[0]), dtype=object)  # type: ignore
 
-    def build_tile_generator(self, wsi: "sf.WSI"):
+    def build_tile_generator(self, wsi: "sf.WSI", **kwargs):
         """Build a tile generator from a slide."""
         generator = wsi.build_generator(
             shuffle=False,
@@ -292,7 +292,9 @@ class _StridedQC_V2:
             img_format='numpy',
             grayspace_fraction=self.gs_fraction,
             pool=self.tile_pool,
-            **self.wsi_kwargs)
+            **self.wsi_kwargs,
+            **kwargs
+        )
         if generator is None:
             sf.log.warning(
                 "Unable to apply QC {} to slide {}; no tiles extracted.".format(
@@ -344,7 +346,7 @@ class _StridedQC_V2:
         g_mask = g_mask.astype(bool)
         return g_mask
 
-    def get_slide_and_mpp(self, wsi: "sf.WSI") -> Tuple["sf.WSI", float]:
+    def get_slide_and_mpp(self, wsi: "sf.WSI", **kwargs) -> Tuple["sf.WSI", float]:
         """Get a WSI object with the proper tile extraction size and stride."""
         stride_div = self.tile_px / (self.tile_px - self.overlap*2)
         qc_wsi = sf.WSI(
@@ -354,7 +356,8 @@ class _StridedQC_V2:
             stride_div=stride_div,
             verbose=False,
             use_edge_tiles=True,
-            roi_method='ignore'
+            roi_method='ignore',
+            **kwargs
         )
         mpp = qc_wsi.tile_um / self.tile_px
         return qc_wsi, mpp
