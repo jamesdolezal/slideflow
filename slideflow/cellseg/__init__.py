@@ -1,5 +1,5 @@
 from . import seg_utils
-from .hovernet import HoVerNet, HoVerNetPlus
+from .hovernet import HoVerNet, HoVerNetPlus, HoVerNetSegment
 from .cellpose_utils import (
     Segmentation,
     follow_flows,
