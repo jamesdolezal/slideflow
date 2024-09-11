@@ -188,7 +188,7 @@ def predict_mil(
         # Create prediction dataframe.
         df_dict = dict(slide=slides)
 
-        # Handle continous outcomes.
+        # Handle continuous outcomes.
         if len(y_true.shape) > 1:
             for i in range(y_true.shape[-1]):
                 df_dict[f'y_true{i}'] = y_true[:, i]
@@ -295,7 +295,7 @@ def predict_multimodal_mil(
     # Create prediction dataframe.
     df_dict = dict(slide=slides)
 
-    # Handle continous outcomes.
+    # Handle continuous outcomes.
     if len(y_true.shape) > 1:
         for i in range(y_true.shape[-1]):
             df_dict[f'y_true{i}'] = y_true[:, i]
